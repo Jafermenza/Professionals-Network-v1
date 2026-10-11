@@ -1,8 +1,9 @@
 import http from "node:http";
+import { authorizePrivateUpload, receivePrivateUpload, confirmPrivateUpload, readAuthorizedPrivateFile, MAX_PRIVATE_UPLOAD_BYTES } from "./src/platform/private-file-storage.js";
 import { randomUUID } from "node:crypto";
 import { loadConfig } from "./src/platform/config.js";
 import { createLogger } from "./src/platform/logger.js";
-import { verifyToken, requireRole, hashSessionToken } from "./src/platform/auth.js";
+import { verifyToken, requireRole, hashSessionToken, withCurrentRoles } from "./src/platform/auth.js";
 import { getPool } from "./src/platform/db.js";
 import * as membership from "./src/membership/service.js";
 import * as verification from "./src/verification/service.js";
@@ -14,6 +15,7 @@ import * as experience from "./src/platform/experience.js";
 import * as applicationTracking from "./src/platform/application-tracking.js";
 import * as publicOpportunity from "./src/platform/public-opportunity.js";
 import * as userAdmin from "./src/platform/user-admin.js";
+import { resolveAllowedOrigin } from "./src/platform/config.js";
 
 const config=loadConfig();
 const logger=createLogger({level:config.logLevel});
@@ -24,6 +26,11 @@ function json(res,status,body,requestId){
 }
 function pathParts(url){ return new URL(url,"http://localhost").pathname.split("/").filter(Boolean); }
 function query(url){ return new URL(url,"http://localhost").searchParams; }
+async function rawBody(req,limit=MAX_PRIVATE_UPLOAD_BYTES){
+  const chunks=[];let size=0;
+  for await (const chunk of req) { size+=chunk.length; if(size>limit) throw Object.assign(new Error("Uploaded file is too large."),{statusCode:413,code:"PAYLOAD_TOO_LARGE"}); chunks.push(chunk); }
+  return Buffer.concat(chunks,size);
+}
 async function body(req){
   let raw="";
   for await (const chunk of req) {
@@ -41,8 +48,16 @@ async function auth(req){
   try {
     const identity=verifyToken(header.slice(7),config.jwtSecret);
     if(!identity.sid) throw Object.assign(new Error("Session-bound authentication required."),{statusCode:401});
-    const db=getPool(); const r=await db.query("select s.user_id,u.status from auth_session s join app_user u on u.id=s.user_id where s.id=$1 and s.revoked_at is null and s.expires_at>now()",[identity.sid]);
+    const db=getPool();
+    const r=await db.query(`select s.user_id,u.status,
+      coalesce(json_agg(distinct role.role_code) filter(where role.role_code is not null),'[]'::json) as roles
+      from auth_session s join app_user u on u.id=s.user_id
+      left join app_user_role ur on ur.user_id=u.id left join app_role role on role.id=ur.role_id
+      where s.id=$1 and s.revoked_at is null and s.expires_at>now()
+      group by s.id,u.id,u.status`,[identity.sid]);
     if(!r.rows[0]||r.rows[0].status!=="active"||r.rows[0].user_id!==identity.sub) throw Object.assign(new Error("Session expired or revoked."),{statusCode:401});
+    // Authorization must use current database roles, never stale role claims from a signed token.
+    identity.roles=withCurrentRoles(identity,Array.isArray(r.rows[0].roles)?r.rows[0].roles:JSON.parse(r.rows[0].roles||"[]")).roles;
     await db.query("update auth_session set last_seen_at=now() where id=$1",[identity.sid]);
     return identity;
   } catch(e){ throw Object.assign(new Error(e.message),{statusCode:e.statusCode===403?403:401,code:"UNAUTHENTICATED"}); }
@@ -62,8 +77,13 @@ async function bootstrapAdmin(){ if(!config.bootstrapAdminEmail||!config.bootstr
 
 const server=http.createServer(async (req,res)=>{
   const requestId=req.headers["x-request-id"]||randomUUID();
-  if(req.method==="OPTIONS"){res.writeHead(204,{"access-control-allow-origin":config.corsOrigin||"*","access-control-allow-methods":"GET,POST,PATCH,DELETE,OPTIONS","access-control-allow-headers":"Authorization,Content-Type,X-Request-Id","access-control-max-age":"600"});return res.end();}
-  if(config.corsOrigin) res.setHeader("access-control-allow-origin",config.corsOrigin);
+  const allowOrigin = resolveAllowedOrigin(req.headers.origin, config.corsOrigin);
+  if(req.method==="OPTIONS"){
+    const headers={"access-control-allow-methods":"GET,POST,PUT,PATCH,DELETE,OPTIONS","access-control-allow-headers":"Authorization,Content-Type,X-Request-Id,X-Upload-Token","access-control-max-age":"600"};
+    if(allowOrigin) headers["access-control-allow-origin"]=allowOrigin;
+    res.writeHead(204,headers);return res.end();
+  }
+  if(allowOrigin) res.setHeader("access-control-allow-origin",allowOrigin);
   res.setHeader("vary","Origin"); res.setHeader("x-content-type-options","nosniff"); res.setHeader("x-frame-options","DENY"); res.setHeader("referrer-policy","strict-origin-when-cross-origin"); res.setHeader("permissions-policy","camera=(),microphone=(),geolocation=()"); if(config.nodeEnv==="production") res.setHeader("strict-transport-security","max-age=31536000; includeSubDomains");
   res.on("finish",()=>logger.info("http.request",{requestId,method:req.method,path:req.url,status:res.statusCode}));
   try {
@@ -77,34 +97,42 @@ const server=http.createServer(async (req,res)=>{
     if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/public/opportunity-inquiries/") && parts[5]==="link") { const identity=await auth(req); const b=await body(req); return ok(res,await publicOpportunity.linkInquiryToAccount(parts[4],b.token||"",identity.sub,requestId),requestId); }
     if(req.method==="GET" && p==="api/v1/jobs") { const q=query(req.url); const v=optionalIdentity(req); return ok(res,await organizationJobs.listJobs({visibility:q.get("visibility"),postingScope:q.get("postingScope"),q:q.get("q"),employmentType:q.get("employmentType"),workMode:q.get("workMode"),seniority:q.get("seniority"),department:q.get("department"),location:q.get("location"),industryReferenceItemId:q.get("industryReferenceItemId"),occupationReferenceItemId:q.get("occupationReferenceItemId")},v?.sub||null),requestId); }
     if(req.method==="GET" && parts.length===4 && p.startsWith("api/v1/jobs/")) { const v=optionalIdentity(req); return ok(res,await organizationJobs.getJob(parts[3],v?.sub||null),requestId); }
+    if(req.method==="GET" && parts.length===5 && p.startsWith("api/v1/jobs/") && parts[4]==="applications") return ok(res,await organizationJobs.listJobApplications(parts[3],identity.sub),requestId);
 
     if(req.method==="GET" && p==="api/v1/services") { const q=query(req.url); return ok(res,await servicesMentorship.listServices(null,{category:q.get("category"),q:q.get("q"),limit:q.get("limit"),offset:q.get("offset")}),requestId); }
     if(req.method==="GET" && parts.length===4 && p.startsWith("api/v1/services/")) return ok(res,await servicesMentorship.getServiceListing(parts[3],null),requestId);
-    if(req.method==="GET" && p==="api/v1/mentors") { const q=query(req.url); return ok(res,await servicesMentorship.listMentors(null,{q:q.get("q"),topic:q.get("topic")}),requestId); }
+    if(req.method==="GET" && p==="api/v1/mentors") { const q=query(req.url); const viewer=req.headers.authorization?.startsWith("Bearer ")?await auth(req):null; return ok(res,await servicesMentorship.listMentors(viewer?.sub||null,{q:q.get("q"),topic:q.get("topic")}),requestId); }
+    if(req.method==="POST" && p==="api/v1/files/uploads") { const identity=await auth(req); return ok(res,await authorizePrivateUpload(identity.sub,await body(req)),requestId,201); }
+    if(req.method==="PUT" && parts.length===6 && p.startsWith("api/v1/files/uploads/") && parts[5]==="content") { const identity=await auth(req); if(!String(req.headers["content-type"]||"").startsWith("application/octet-stream")) throw Object.assign(new Error("Upload content must use application/octet-stream."),{statusCode:415,code:"UNSUPPORTED_MEDIA_TYPE"}); const result=await receivePrivateUpload(identity.sub,parts[4],String(req.headers["x-upload-token"]||""),await rawBody(req)); return ok(res,result,requestId,201); }
+    if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/files/uploads/") && parts[5]==="confirm") { const identity=await auth(req); return ok(res,await confirmPrivateUpload(identity.sub,parts[4]),requestId,201); }
+    if(req.method==="GET" && parts.length===4 && p.startsWith("api/v1/files/")) { const identity=await auth(req); const result=await readAuthorizedPrivateFile(identity.sub,parts[3],identity.roles||[],requestId); res.writeHead(200,{"content-type":result.file.content_type,"content-length":String(result.bytes.length),"content-disposition":"attachment; filename*=UTF-8''"+encodeURIComponent(result.file.original_name),"cache-control":"private, no-store","x-content-type-options":"nosniff","x-request-id":requestId}); return res.end(result.bytes); }
     if(req.method==="POST" && p==="api/v1/auth/register") { publicRateLimit(req,"register",5,60000); return ok(res,await membership.register(await body(req),requestId),requestId,201); }
     if(req.method==="GET" && p==="api/v1/membership/products") return ok(res,await membership.listMembershipProducts(),requestId);
     if(req.method==="POST" && p==="api/v1/auth/login") {
-      publicRateLimit(req,"login",20,60000); const b=await body(req); return ok(res,await membership.login(b.email,b.password,requestId,{ip:clientIp(req),userAgent:req.headers["user-agent"]||null}),requestId);
+      const b=await body(req); publicRateLimit(req,"login:"+String(b.email||"").trim().toLowerCase(),20,60000); return ok(res,await membership.login(b.email,b.password,requestId,{ip:clientIp(req),userAgent:req.headers["user-agent"]||null}),requestId);
     }
 
-    if(req.method==="POST" && p==="api/v1/auth/logout") { const identity=await auth(req); return ok(res,await userAdmin.logout(identity.sub,identity.sid),requestId); }
+    if(req.method==="POST" && p==="api/v1/auth/logout") { const identity=await auth(req); return ok(res,await userAdmin.logout(identity.sub,identity.sid,requestId),requestId); }
     if(req.method==="GET" && p==="api/v1/admin/users") { const identity=await auth(req); return ok(res,await userAdmin.listUsers(identity,{q:query(req.url).get("q"),status:query(req.url).get("status")}),requestId); }
+    if(req.method==="GET" && p==="api/v1/admin/roles") { const identity=await auth(req); return ok(res,await userAdmin.listRoles(identity.sub),requestId); }
     if(req.method==="PATCH" && parts.length===5 && p.startsWith("api/v1/admin/users/")) { const identity=await auth(req); return ok(res,await userAdmin.updateUser(identity.sub,parts[4],await body(req),requestId),requestId); }
-    if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/admin/users/") && parts[5]==="revoke-sessions") { const identity=await auth(req); return ok(res,await userAdmin.revokeSessions(identity.sub,parts[4],requestId),requestId); }
-    if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/admin/users/") && parts[5]==="reset-password") { const identity=await auth(req); const b=await body(req); return ok(res,await userAdmin.resetPassword(identity.sub,parts[4],b.password,requestId),requestId); }
+    if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/admin/users/") && parts[5]==="revoke-sessions") { const identity=await auth(req); const b=await body(req); return ok(res,await userAdmin.revokeSessions(identity.sub,parts[4],requestId,b.reason),requestId); }
+    if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/admin/users/") && parts[5]==="reset-password") { const identity=await auth(req); const b=await body(req); return ok(res,await userAdmin.resetPassword(identity.sub,parts[4],b.password,requestId,b.reason),requestId); }
     if(req.method==="GET" && p==="api/v1/experience/demo-cases") return ok(res,await experience.listDemoCases(),requestId);
     if(req.method==="GET" && parts.length===5 && p.startsWith("api/v1/experience/demo-cases/")) return ok(res,await experience.getDemoCase(parts[4]),requestId);
     if(req.method==="GET" && p==="api/v1/experience/guides") { const q=query(req.url); return ok(res,await experience.listGuides(q.get("route")),requestId); }
 
-    const identity=await auth(req);
-    if(req.method==="GET" && p==="api/v1/me") {
-      const db=getPool();
-      const result=await db.query(`select u.id,u.email,u.status,coalesce(json_agg(r.role_code) filter (where r.role_code is not null),'[]'::json) as roles
-        from app_user u left join app_user_role ur on ur.user_id=u.id left join app_role r on r.id=ur.role_id
-        where u.id=$1 group by u.id,u.email,u.status`,[identity.sub]);
-      if(!result.rows[0] || result.rows[0].status!=="active") throw Object.assign(new Error("Account is not active."),{statusCode:403,code:"ACCOUNT_INACTIVE"});
-      return ok(res,{id:result.rows[0].id,email:result.rows[0].email,status:result.rows[0].status,roles:result.rows[0].roles},requestId);
+    if(req.method==="GET" && p==="api/v1/talent"){
+      const q=query(req.url);
+      const viewer=req.headers.authorization?.startsWith("Bearer ")?await auth(req):null;
+      return ok(res,await talent.searchTalent(viewer?.sub||null,{q:q.get("q"),occupation:q.get("occupation"),industry:q.get("industry"),educationLevel:q.get("educationLevel"),qualificationType:q.get("qualificationType"),fieldOfStudy:q.get("fieldOfStudy"),availability:q.get("availability"),location:q.get("location"),verifiedClaim:q.get("verifiedClaim"),limit:q.get("limit"),offset:q.get("offset")}),requestId);
     }
+    if(req.method==="GET" && parts.length===4 && p.startsWith("api/v1/talent/") && !["inquiries","saved-searches"].includes(parts[3])){
+      const viewer=req.headers.authorization?.startsWith("Bearer ")?await auth(req):null;
+      return ok(res,await talent.getTalent(parts[3],viewer?.sub||null),requestId);
+    }
+
+    const identity=await auth(req);
     if(req.method==="POST" && p==="api/v1/admin/experience/demo-cases") { return ok(res,await experience.createDemoCase(identity.sub,await body(req),requestId),requestId,201); }
     if(req.method==="PATCH" && parts.length===6 && p.startsWith("api/v1/admin/experience/demo-cases/")) { return ok(res,await experience.updateDemoCase(parts[5],identity.sub,await body(req),requestId),requestId); }
     if(req.method==="POST" && p==="api/v1/admin/experience/guides") { return ok(res,await experience.createGuide(identity.sub,await body(req),requestId),requestId,201); }
@@ -118,6 +146,7 @@ const server=http.createServer(async (req,res)=>{
     if(req.method==="POST" && parts.length===5 && p.startsWith("api/v1/organizations/") && parts[4]==="users") return ok(res,await organizationJobs.addOrganizationUser(parts[3],identity.sub,await body(req),requestId),requestId,201);
     if(req.method==="PATCH" && parts.length===6 && p.startsWith("api/v1/organizations/") && parts[4]==="users") return ok(res,await organizationJobs.updateOrganizationUser(parts[3],identity.sub,parts[5],await body(req),requestId),requestId);
     if(req.method==="GET" && parts.length===5 && p.startsWith("api/v1/organizations/") && parts[4]==="users") return ok(res,await organizationJobs.listOrganizationUsers(parts[3],identity.sub),requestId);
+    if(req.method==="GET" && p==="api/v1/review/organizations") return ok(res,await organizationJobs.listOrganizationVerificationQueue(identity.sub),requestId);
     if(req.method==="POST" && p==="api/v1/review/organizations") { anyRole(identity,["reviewer","system_admin"]); const b=await body(req); return ok(res,await organizationJobs.reviewOrganization(b.organizationId,identity.sub,b,requestId),requestId); }
     if(req.method==="GET" && p==="api/v1/admin/organization-verification-requirements") return ok(res,await organizationJobs.listOrganizationVerificationRequirements(identity.sub),requestId);
     if(req.method==="POST" && p==="api/v1/admin/organization-verification-requirements") return ok(res,await organizationJobs.createOrganizationVerificationRequirement(identity.sub,await body(req),requestId),requestId,201);
@@ -166,30 +195,37 @@ const server=http.createServer(async (req,res)=>{
     if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/service-deliveries/") && parts[5]==="review") return ok(res,await servicesMentorship.reviewServiceDelivery(parts[4],identity.sub,await body(req),requestId),requestId);
     if(req.method==="POST" && parts.length===5 && p.startsWith("api/v1/service-requests/") && parts[4]==="feedback") return ok(res,await servicesMentorship.submitServiceFeedback(parts[3],identity.sub,await body(req),requestId),requestId,201);
     if(req.method==="GET" && p==="api/v1/mentors") { const q=query(req.url); return ok(res,await servicesMentorship.listMentors(identity.sub,{q:q.get("q"),topic:q.get("topic")}),requestId); }
+    if(req.method==="GET" && p==="api/v1/me/mentor-profile") return ok(res,await servicesMentorship.getMyMentorProfile(identity.sub),requestId);
     if(req.method==="POST" && p==="api/v1/me/mentor-profile") return ok(res,await servicesMentorship.createMentorProfile(identity.sub,await body(req),requestId),requestId,201);
     if(req.method==="PATCH" && parts.length===4 && p.startsWith("api/v1/mentor-profiles/")) return ok(res,await servicesMentorship.updateMentorProfile(parts[3],identity.sub,await body(req),requestId),requestId);
     if(req.method==="POST" && parts.length===5 && p.startsWith("api/v1/mentor-profiles/") && parts[4]==="status") { const b=await body(req); return ok(res,await servicesMentorship.changeMentorStatus(parts[3],identity.sub,b.status,requestId),requestId); }
     if(req.method==="PUT" && parts.length===5 && p.startsWith("api/v1/mentor-profiles/") && parts[4]==="availability") return ok(res,await servicesMentorship.setMentorAvailability(parts[3],identity.sub,await body(req),requestId),requestId);
     if(req.method==="POST" && parts.length===5 && p.startsWith("api/v1/mentor-profiles/") && parts[4]==="time-off") return ok(res,await servicesMentorship.addMentorTimeOff(parts[3],identity.sub,await body(req),requestId),requestId,201);
+    if(req.method==="GET" && p==="api/v1/me/mentorship-requests") return ok(res,await servicesMentorship.listMyMentorshipRequests(identity.sub),requestId);
+    if(req.method==="GET" && p==="api/v1/me/mentorship-matches") return ok(res,await servicesMentorship.listMyMentorshipMatches(identity.sub),requestId);
+    if(req.method==="GET" && p==="api/v1/me/mentorships") return ok(res,await servicesMentorship.listMyMentorships(identity.sub),requestId);
     if(req.method==="POST" && p==="api/v1/mentorship/requests") return ok(res,await servicesMentorship.createMentorshipRequest(identity.sub,await body(req),requestId),requestId,201);
-    if(req.method==="GET" && parts.length===5 && p.startsWith("api/v1/mentorship/requests/") && parts[4]==="matches") return ok(res,await servicesMentorship.findMentorMatches(parts[3],identity.sub),requestId);
-    if(req.method==="POST" && parts.length===5 && p.startsWith("api/v1/mentorship/requests/") && parts[4]==="match") { const b=await body(req); return ok(res,await servicesMentorship.proposeMentorMatch(parts[3],b.mentorUserId,identity.sub,requestId),requestId,201); }
+    if(req.method==="GET" && parts.length===5 && p.startsWith("api/v1/mentorship/requests/")) return ok(res,await servicesMentorship.getMentorshipRequest(parts[4],identity.sub),requestId);
+    if(req.method==="GET" && parts.length===6 && p.startsWith("api/v1/mentorship/requests/") && parts[5]==="matches") return ok(res,await servicesMentorship.findMentorMatches(parts[4],identity.sub),requestId);
+    if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/mentorship/requests/") && parts[5]==="match") { const b=await body(req); return ok(res,await servicesMentorship.proposeMentorMatch(parts[4],b.mentorUserId,identity.sub,requestId),requestId,201); }
     if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/mentorship/matches/") && parts[5]==="response") { const b=await body(req); return ok(res,await servicesMentorship.respondToMatch(parts[4],identity.sub,b.status,requestId),requestId); }
     if(req.method==="GET" && parts.length===4 && p.startsWith("api/v1/mentorship/")) return ok(res,await servicesMentorship.getMentorship(parts[3],identity.sub),requestId);
     if(req.method==="GET" && parts.length===5 && p.startsWith("api/v1/mentorship/") && parts[4]==="goals") return ok(res,await servicesMentorship.listMentorshipGoals(parts[3],identity.sub),requestId);
     if(req.method==="POST" && parts.length===5 && p.startsWith("api/v1/mentorship/") && parts[4]==="goals") return ok(res,await servicesMentorship.createMentorshipGoal(parts[3],identity.sub,await body(req),requestId),requestId,201);
     if(req.method==="PATCH" && parts.length===4 && p.startsWith("api/v1/mentorship-goals/")) return ok(res,await servicesMentorship.updateMentorshipGoal(parts[3],identity.sub,await body(req),requestId),requestId);
     if(req.method==="POST" && parts.length===5 && p.startsWith("api/v1/mentorship/") && parts[4]==="status") { const b=await body(req); return ok(res,await servicesMentorship.changeMentorshipStatus(parts[3],identity.sub,b.status,b.note,requestId),requestId); }
+    if(req.method==="GET" && parts.length===5 && p.startsWith("api/v1/mentorship/") && parts[4]==="sessions") return ok(res,await servicesMentorship.listMentorshipSessions(parts[3],identity.sub),requestId);
     if(req.method==="POST" && parts.length===5 && p.startsWith("api/v1/mentorship/") && parts[4]==="sessions") return ok(res,await servicesMentorship.createMentorshipSession(parts[3],identity.sub,await body(req),requestId),requestId,201);
     if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/mentorship/sessions/") && parts[5]==="status") { const b=await body(req); return ok(res,await servicesMentorship.changeMentorshipSession(parts[4],identity.sub,b.status,b.notes,requestId),requestId); }
     if(req.method==="POST" && parts.length===5 && p.startsWith("api/v1/mentorship/") && parts[4]==="feedback") return ok(res,await servicesMentorship.submitMentorshipFeedback(parts[3],identity.sub,await body(req),requestId),requestId,201);
     if(req.method==="GET" && p==="api/v1/me/outcomes") return ok(res,await stakeholderOutcomes.getMyOutcomeWorkspace(identity.sub),requestId);
     if(req.method==="GET" && p==="api/v1/opportunity-inquiries") { const identity=await auth(req); return ok(res,await publicOpportunity.listInquiries(identity.sub,{type:query(req.url).get("type"),status:query(req.url).get("status")}),requestId); }
     if(req.method==="PATCH" && parts.length===4 && p.startsWith("api/v1/opportunity-inquiries/")) { const identity=await auth(req); const b=await body(req); return ok(res,await publicOpportunity.decideInquiry(parts[3],identity.sub,b,requestId),requestId); }
-    if(req.method==="GET" && p==="api/v1/me/application-tracking") return ok(res,await applicationTracking.getApplicationTracking(identity.sub),requestId);
+    if(req.method==="GET" && p==="api/v1/me/application-tracking") { const q=query(req.url); return ok(res,await applicationTracking.getApplicationTracking(identity.sub,{limit:q.get("limit")||undefined,offset:q.get("offset")||undefined,reference:q.get("reference")||undefined}),requestId); }
     if(req.method==="GET" && p==="api/v1/me") return ok(res,await membership.getMe(identity.sub),requestId);
     if(req.method==="PATCH" && p==="api/v1/me/profile") return ok(res,await membership.updateProfile(identity.sub,await body(req),requestId),requestId);
     if(req.method==="GET" && p==="api/v1/membership/history") return ok(res,await membership.history(identity.sub),requestId);
+    if(req.method==="GET" && p==="api/v1/membership/applications/me") return ok(res,await membership.listMyApplications(identity.sub),requestId);
     if(req.method==="GET" && p==="api/v1/notifications/preferences") return ok(res,await membership.notificationPreferences(identity.sub),requestId);
     if(req.method==="PATCH" && p==="api/v1/notifications/preferences") return ok(res,await membership.notificationPreferences(identity.sub,await body(req)),requestId);
     if(req.method==="POST" && p==="api/v1/membership/applications") {
@@ -220,14 +256,10 @@ const server=http.createServer(async (req,res)=>{
       anyRole(identity,["reviewer","finance_officer","system_admin"]); return ok(res,await membership.listApplicationsForReview(),requestId);
     }
 
+    if(req.method==="GET" && p==="api/v1/me/talent-profile") return ok(res,await talent.getProfessionalProfile(identity.sub),requestId);
     if(req.method==="PATCH" && p==="api/v1/me/talent-profile") return ok(res,await talent.updateProfessionalProfile(identity.sub,await body(req),requestId),requestId);
     if(req.method==="GET" && p==="api/v1/me/talent-visibility") return ok(res,await talent.getVisibility(identity.sub),requestId);
     if(req.method==="PATCH" && p==="api/v1/me/talent-visibility") return ok(res,await talent.updateVisibility(identity.sub,await body(req),requestId),requestId);
-    if(req.method==="GET" && p==="api/v1/talent"){
-      const q=query(req.url);
-      return ok(res,await talent.searchTalent(identity.sub,{q:q.get("q"),occupation:q.get("occupation"),industry:q.get("industry"),educationLevel:q.get("educationLevel"),qualificationType:q.get("qualificationType"),fieldOfStudy:q.get("fieldOfStudy"),availability:q.get("availability"),location:q.get("location"),verifiedClaim:q.get("verifiedClaim"),limit:q.get("limit"),offset:q.get("offset")}),requestId);
-    }
-    if(req.method==="GET" && parts.length===4 && p.startsWith("api/v1/talent/")) return ok(res,await talent.getTalent(parts[3],identity.sub),requestId);
     if(req.method==="POST" && p==="api/v1/talent/saved-searches") return ok(res,await talent.saveSearch(identity.sub,await body(req),requestId),requestId,201);
     if(req.method==="GET" && p==="api/v1/talent/saved-searches") return ok(res,await talent.listSavedSearches(identity.sub),requestId);
     if(req.method==="POST" && p==="api/v1/talent/inquiries") return ok(res,await talent.createTalentInquiry(identity.sub,await body(req),requestId),requestId,201);
@@ -235,46 +267,49 @@ const server=http.createServer(async (req,res)=>{
     if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/talent/inquiries/") && parts[5]==="response") return ok(res,await talent.respondToTalentInquiry(parts[4],identity.sub,await body(req),requestId),requestId);
     if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/talent/inquiries/") && parts[5]==="close") return ok(res,await talent.closeTalentInquiry(parts[4],identity.sub,requestId),requestId);
 
+    if(req.method==="GET" && p==="api/v1/verification/programs") return ok(res,await verification.listPrograms(),requestId);
+    if(req.method==="GET" && p==="api/v1/me/verification/cases") return ok(res,await verification.listCases({subjectUserId:identity.sub}),requestId);
     if(req.method==="POST" && p==="api/v1/verification/cases"){
       const b=await body(req);
       if(b.subjectUserId && b.subjectUserId!==identity.sub) anyRole(identity,["verification_reviewer","ethics_reviewer","system_admin"]);
       else requireRole(identity,"member");
       return ok(res,await verification.createCase(b.subjectUserId||identity.sub,b.programCode,identity.sub,requestId),requestId,201);
     }
-    if(req.method==="POST" && parts.length===5 && p.startsWith("api/v1/verification/cases/") && parts[4]==="consent"){ const b=await body(req); return ok(res,await verification.giveConsent(parts[3],identity.sub,b.consentVersion,requestId),requestId); }
-    if(req.method==="GET" && parts.length===4 && p.startsWith("api/v1/verification/cases/")){
-      const c=await verification.getCase(parts[3],identity.sub);
+    if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/verification/cases/") && parts[5]==="consent"){ const b=await body(req); return ok(res,await verification.giveConsent(parts[4],identity.sub,b.consentVersion,requestId),requestId); }
+    if(req.method==="GET" && parts.length===5 && p.startsWith("api/v1/verification/cases/")){
+      const c=await verification.getCase(parts[4],identity.sub);
       return ok(res,c,requestId);
     }
+    if(req.method==="GET" && p==="api/v1/review/verification/appeals") return ok(res,await verification.listAppealsForReview(identity.sub),requestId);
     if(req.method==="GET" && p==="api/v1/review/verification/cases"){
       anyRole(identity,["verification_reviewer","ethics_reviewer","system_admin"]);
       const q=query(req.url);
       return ok(res,await verification.listCases({status:q.get("status"),programCode:q.get("programCode"),reviewerId:q.get("reviewerId"),limit:q.get("limit"),offset:q.get("offset")}),requestId);
     }
-    if(req.method==="POST" && parts.length===5 && p.startsWith("api/v1/verification/cases/") && parts[4]==="assign"){
+    if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/verification/cases/") && parts[5]==="assign"){
       anyRole(identity,["verification_reviewer","system_admin"]); const b=await body(req);
-      return ok(res,await verification.assignCase(parts[3],b.reviewerId,identity.sub,requestId),requestId);
+      return ok(res,await verification.assignCase(parts[4],b.reviewerId,identity.sub,requestId),requestId);
     }
-    if(req.method==="POST" && parts.length===5 && p.startsWith("api/v1/verification/cases/") && parts[4]==="transition"){
+    if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/verification/cases/") && parts[5]==="transition"){
       anyRole(identity,["verification_reviewer","ethics_reviewer","system_admin"]); const b=await body(req);
-      return ok(res,await verification.transitionCase(parts[3],b.status,identity.sub,requestId),requestId);
+      return ok(res,await verification.transitionCase(parts[4],b.status,identity.sub,requestId),requestId);
     }
-    if(req.method==="POST" && parts.length===5 && p.startsWith("api/v1/verification/cases/") && parts[4]==="claims"){
-      const b=await body(req); const c=await verification.getCase(parts[3]);
+    if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/verification/cases/") && parts[5]==="claims"){
+      const b=await body(req); const c=await verification.getCase(parts[4]);
       if(c.subject_user_id!==identity.sub) anyRole(identity,["verification_reviewer","ethics_reviewer","system_admin"]);
-      return ok(res,await verification.addClaim(parts[3],b.claimTypeCode,b.claimedValue,identity.sub,requestId),requestId,201);
+      return ok(res,await verification.addClaim(parts[4],b.claimTypeCode,b.claimedValue,identity.sub,requestId),requestId,201);
     }
-    if(req.method==="POST" && parts.length===5 && p.startsWith("api/v1/verification/cases/") && parts[4]==="evidence"){
-      const b=await body(req); const c=await verification.getCase(parts[3]);
+    if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/verification/cases/") && parts[5]==="evidence"){
+      const b=await body(req); const c=await verification.getCase(parts[4]);
       if(c.subject_user_id!==identity.sub) anyRole(identity,["verification_reviewer","ethics_reviewer","system_admin"]);
-      return ok(res,await verification.addEvidence(parts[3],b,identity.sub,requestId),requestId,201);
+      return ok(res,await verification.addEvidence(parts[4],b,identity.sub,requestId),requestId,201);
     }
-    if(req.method==="POST" && parts.length===5 && p.startsWith("api/v1/verification/cases/") && parts[4]==="decision"){
+    if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/verification/cases/") && parts[5]==="decision"){
       anyRole(identity,["verification_reviewer","ethics_reviewer","system_admin"]);
-      return ok(res,await verification.decide(parts[3],await body(req),identity.sub,requestId),requestId);
+      return ok(res,await verification.decide(parts[4],await body(req),identity.sub,requestId),requestId);
     }
-    if(req.method==="POST" && parts.length===5 && p.startsWith("api/v1/verification/cases/") && parts[4]==="response") return ok(res,await verification.memberResponse(parts[3],await body(req),identity.sub,requestId),requestId);
-    if(req.method==="POST" && parts.length===5 && p.startsWith("api/v1/verification/cases/") && parts[4]==="appeal") return ok(res,await verification.submitAppeal(parts[3],await body(req),identity.sub,requestId),requestId,201);
+    if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/verification/cases/") && parts[5]==="response") return ok(res,await verification.memberResponse(parts[4],await body(req),identity.sub,requestId),requestId);
+    if(req.method==="POST" && parts.length===6 && p.startsWith("api/v1/verification/cases/") && parts[5]==="appeal") return ok(res,await verification.submitAppeal(parts[4],await body(req),identity.sub,requestId),requestId,201);
     if(req.method==="POST" && parts.length===5 && p.startsWith("api/v1/verification/appeals/") && parts[4]==="decision"){
       anyRole(identity,["appeal_reviewer","system_admin"]);
       return ok(res,await verification.decideAppeal(parts[3],await body(req),identity.sub,requestId),requestId);

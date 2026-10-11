@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { withTransaction, getPool } from "../platform/db.js";
 import { signToken, newSessionToken, hashSessionToken, sessionTokenPayload } from "../platform/auth.js";
 import { loadConfig } from "../platform/config.js";
+import { nextTrackingReference } from "../platform/tracking-reference.js";
 import { hashPassword, verifyPassword, normalizeEmail, normalizePhone, normalizeName, validatePersonInput } from "./identity.js";
 
 function httpError(status,message,code="BUSINESS_RULE"){
@@ -89,7 +90,8 @@ export async function login(email,password,requestId,requestMeta={}){
 export async function getMe(userId){
   const db=getPool();
   const r=await db.query(`select u.id user_id,u.email,u.status,p.id person_id,p.first_name,p.middle_name,p.last_name,p.display_name,p.phone,p.date_of_birth,p.sex,p.nationality,
-    pr.id profile_id,pr.headline,pr.bio,pr.visibility,pr.completion_percent
+    pr.id profile_id,pr.headline,pr.bio,pr.visibility,pr.completion_percent,
+    coalesce((select jsonb_agg(r.role_code order by r.role_code) from app_user_role ur join app_role r on r.id=ur.role_id where ur.user_id=u.id),'[]'::jsonb) roles
     from app_user u left join person p on p.user_id=u.id left join professional_profile pr on pr.person_id=p.id where u.id=$1`,[userId]);
   if(!r.rows[0]) throw httpError(404,"Account not found.","NOT_FOUND");
   return r.rows[0];
@@ -109,6 +111,20 @@ export async function updateProfile(userId,input,requestId){
     await audit(db,userId,"profile.updated","person",p.id,requestId);
   });
   return getMe(userId);
+}
+
+export async function listMyApplications(userId){
+  const db=getPool();
+  return (await db.query(`select a.id,a.tracking_reference,a.application_type,a.status,a.submitted_at,a.reviewed_at,a.approved_at,a.created_at,a.updated_at,
+      a.data_snapshot,a.fee_snapshot,
+      (select jsonb_build_object('id',p.id,'status',p.status,'amount',p.amount,'currency',p.currency,'channel',p.channel,'created_at',p.created_at,'verified_at',p.verified_at)
+       from membership_application_payment ap join payment_transaction p on p.id=ap.payment_transaction_id
+       where ap.application_id=a.id order by p.created_at desc limit 1) as payment,
+      (select jsonb_build_object('id',c.id,'requested_fields',c.requested_fields,'reviewer_note',c.reviewer_note,'status',c.status,'applicant_response',c.applicant_response)
+       from membership_correction c where c.application_id=a.id order by c.created_at desc limit 1) as latest_correction,
+      coalesce((select jsonb_agg(jsonb_build_object('id',aa.id,'fileObjectId',f.id,'fileName',f.original_name,'attachmentType',aa.attachment_type,'createdAt',aa.created_at) order by aa.created_at desc)
+       from membership_application_attachment aa join file_object f on f.id=aa.file_object_id where aa.application_id=a.id),'[]'::jsonb) attachments
+    from membership_application a where a.user_id=$1 order by a.created_at desc`,[userId])).rows;
 }
 
 export async function listMembershipProducts(){
@@ -138,8 +154,9 @@ export async function createApplication(userId,input,requestId){
     const me=await getMe(userId);
     const snapshot={person:{firstName:me.first_name,middleName:me.middle_name,lastName:me.last_name,displayName:me.display_name,phone:me.phone,dateOfBirth:me.date_of_birth,sex:me.sex,nationality:me.nationality},profile:{headline:me.headline,bio:me.bio}};
     const fee={productCode:prod.product_code,productName:prod.name,amount:amountFromProduct(prod),currency:prod.currency,billingModel:prod.billing_model,durationDays:prod.duration_days};
-    const row=(await db.query(`insert into membership_application(user_id,application_type,previous_membership_id,membership_product_id,status,submitted_at,data_snapshot,fee_snapshot)
-      values($1,$2,$3,$4,'submitted',now(),$5,$6) returning *`,[userId,type,active.rows[0]?.id||null,prod.id,snapshot,fee])).rows[0];
+    const trackingReference=await nextTrackingReference(db,"membership");
+    const row=(await db.query(`insert into membership_application(user_id,tracking_reference,application_type,previous_membership_id,membership_product_id,status,submitted_at,data_snapshot,fee_snapshot)
+      values($1,$2,$3,$4,$5,'submitted',now(),$6,$7) returning *`,[userId,trackingReference,type,active.rows[0]?.id||null,prod.id,snapshot,fee])).rows[0];
     await audit(db,userId,"membership.application_submitted","membership_application",row.id,requestId,{applicationType:type,productCode:prod.product_code});
     await notify(db,userId,"membership_application_submitted","membership_application",row.id,{productCode:prod.product_code});
     return row;
@@ -267,9 +284,12 @@ export async function history(userId){
 
 export async function listApplicationsForReview(){
   const db=getPool();
-  const r=await db.query(`select a.id,a.user_id,a.application_type,a.status,a.submitted_at,a.created_at,a.data_snapshot,a.fee_snapshot,p.product_code,p.name
+  const r=await db.query(`select a.id,a.user_id,a.application_type,a.status,a.submitted_at,a.created_at,a.updated_at,a.data_snapshot,a.fee_snapshot,p.product_code,p.name,
+      (select jsonb_build_object('id',pt.id,'status',pt.status,'amount',pt.amount,'currency',pt.currency,'channel',pt.channel,'created_at',pt.created_at)
+       from membership_application_payment ap join payment_transaction pt on pt.id=ap.payment_transaction_id
+       where ap.application_id=a.id order by pt.created_at desc limit 1) payment
     from membership_application a join membership_product p on p.id=a.membership_product_id
-    where a.status in ('submitted','in_review','correction_required') order by a.created_at asc`);
+    where a.status in ('submitted','in_review','correction_required','payment_pending','paid') order by a.created_at asc`);
   return r.rows;
 }
 
